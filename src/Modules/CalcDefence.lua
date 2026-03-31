@@ -19,6 +19,7 @@ local m_huge = math.huge
 local s_format = string.format
 
 local tempTable1 = { }
+local nextResConversionSourceId = 0
 
 local isElemental = { Fire = true, Cold = true, Lightning = true }
 
@@ -27,6 +28,22 @@ local hitSourceList = {"Attack", "Spell"}
 local dmgTypeList = {"Physical", "Lightning", "Cold", "Fire", "Chaos"}
 
 local resistTypeList = { "Fire", "Cold", "Lightning", "Chaos" }
+
+local function getResistanceConversionSourceKey(mod)
+	if not mod.resistanceConversionSourceKey then
+		nextResConversionSourceId = nextResConversionSourceId + 1
+		mod.resistanceConversionSourceKey = s_format("resistance_conversion_%d", nextResConversionSourceId)
+	end
+	return mod.resistanceConversionSourceKey
+end
+
+local function replaceResistanceConversionMod(modDB, modName, modType, value, sourceLabel, sourceKey)
+	local mod = modLib.createMod(modName, modType, value, s_format("%s [%s]", sourceLabel, sourceKey))
+	mod.resistanceConversionSourceKey = sourceKey
+	if not modDB:ReplaceModInternal(mod) then
+		modDB:AddMod(mod)
+	end
+end
 
 -- Calculate hit chance
 function calcs.hitChance(evasion, accuracy)
@@ -526,9 +543,14 @@ function calcs.resistances(actor)
 						end
 					end
 				end
-				if maxRes ~= 0 then
-					modDB:NewMod(resTo.."ResistMax", "BASE", maxRes * conversionRate, resFrom.." To "..resTo.." Max Resistance Conversion")
-				end
+				replaceResistanceConversionMod(
+					modDB,
+					resTo.."ResistMax",
+					"BASE",
+					maxRes * conversionRate,
+					resFrom.." To "..resTo.." Max Resistance Conversion",
+					s_format("max:%s:%s", resFrom, resTo)
+				)
 			end
 		end
 	end
@@ -546,14 +568,35 @@ function calcs.resistances(actor)
 						end
 					end
 				end
-				if res ~= 0 then
-					modDB:NewMod(resTo.."Resist", "BASE", res * conversionRate, resFrom.." To "..resTo.." Resistance Conversion")
-				end
+				replaceResistanceConversionMod(
+					modDB,
+					resTo.."Resist",
+					"BASE",
+					res * conversionRate,
+					resFrom.." To "..resTo.." Resistance Conversion",
+					s_format("base:%s:%s", resFrom, resTo)
+				)
 				for _, mod in ipairs(modDB:Tabulate("INC", nil, resFrom.."Resist")) do
-					modDB:NewMod(resTo.."Resist", "INC", mod.value * conversionRate, mod.mod.source)
+					local sourceKey = s_format("%s>%s", getResistanceConversionSourceKey(mod.mod), resTo)
+					replaceResistanceConversionMod(
+						modDB,
+						resTo.."Resist",
+						"INC",
+						mod.value * conversionRate,
+						s_format("%s %s To %s Resistance Conversion", mod.mod.source or "Unknown", resFrom, resTo),
+						sourceKey
+					)
 				end
 				for _, mod in ipairs(modDB:Tabulate("MORE", nil, resFrom.."Resist")) do
-					modDB:NewMod(resTo.."Resist", "MORE", mod.value * conversionRate, mod.mod.source)
+					local sourceKey = s_format("%s>%s", getResistanceConversionSourceKey(mod.mod), resTo)
+					replaceResistanceConversionMod(
+						modDB,
+						resTo.."Resist",
+						"MORE",
+						mod.value * conversionRate,
+						s_format("%s %s To %s Resistance Conversion", mod.mod.source or "Unknown", resFrom, resTo),
+						sourceKey
+					)
 				end
 			end
 		end
@@ -998,10 +1041,29 @@ function calcs.defence(env, actor)
 		end
 		local convManaToES = modDB:Sum("BASE", nil, "ManaGainAsEnergyShield")
 		if convManaToES > 0 then
-			energyShieldBase = modDB:Sum("BASE", nil, "Mana") * convManaToES / 100
-			energyShield = energyShield + energyShieldBase * calcLib.mod(modDB, nil, "Mana", "EnergyShield", "Defences") 
+			-- Gain-as-extra mechanics should scale with both maximum Mana and maximum Energy Shield.
+			-- Use the unrounded maximum Mana total here so we don't lose precision before the
+			-- Energy Shield scaling and final rounding steps are applied.
+			local manaInc = 1 + modDB:Sum("INC", nil, "Mana") / 100
+			local manaMore = modDB:More(nil, "Mana")
+			local combinedInc = 1 + modDB:Sum("INC", nil, "Mana", "EnergyShield", "Defences") / 100
+			local combinedMore = modDB:More(nil, "Mana", "EnergyShield", "Defences")
+			local manaTotal = calcLib.val(modDB, "Mana") * (1 - convManaToArmour / 100)
+			local manaToESBase = manaTotal * convManaToES / 100
+			local relativeInc = manaInc ~= 0 and combinedInc / manaInc or 1
+			local relativeMore = manaMore ~= 0 and combinedMore / manaMore or 1
+			local total = manaToESBase * relativeInc * relativeMore
+			energyShield = energyShield + total
 			if breakdown then
-				breakdown.slot("Conversion", "Mana to Energy Shield", nil, energyShieldBase, nil, "EnergyShield", "Defences", "Mana")
+				t_insert(breakdown["EnergyShield"].slots, {
+					base = manaToESBase,
+					inc = (relativeInc ~= 1) and s_format(" x %.2f", relativeInc),
+					more = (relativeMore ~= 1) and s_format(" x %.2f", relativeMore),
+					total = s_format("%.2f", total),
+					source = "Conversion",
+					sourceName = "Mana to Energy Shield",
+					item = actor.itemList["Conversion"],
+				})
 			end
 		end
 		local convLifeToArmour = modDB:Sum("BASE", nil, "LifeGainAsArmour")
